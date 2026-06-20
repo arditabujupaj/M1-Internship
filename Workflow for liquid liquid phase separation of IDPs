@@ -34,8 +34,7 @@ if they undergo liquid-liquid phase separation at those conditions.
 
 While running, the script records the energy, forces, temperature, and radius of gyration of the chains.
 
-The analysis extracts the phase concentrations from the slab, following Dignon 2018(Mammen Regy R, Zheng W, Mittal J. Using a sequence-specific coarse-grained model for studying protein
-liquid-liquid phase separation. Methods Enzymol. 2021;646:1-17. doi: 10.1016/bs.mie.2020.07.009. Epub 2020Aug 17. PMID: 33453922; PMCID: PMC7873582) a paper which Regy at al 2021 is based on. 
+The analysis extracts the phase concentrations from the slab, following Dignon 2018
 For each frame it finds the largest cluster of chains (the condensate) from their centre-of-mass distances, shifts that slab to the
 centre of the box, and counts how many beads fall along the z-axis to build a density profile. The dense
 concentration is read from the middle of the slab and the dilute concentration from the edges, both converted
