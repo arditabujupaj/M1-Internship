@@ -1,0 +1,652 @@
+
+
+"""M1 Internship report code For Single chain Differentiable Simulator Toy Model for updating force fields parameters to match IDP radius of gyration in JAX
+                                                
+                                               Author:Ardite Bujupaj M1 Quantitative Biology
+                                               Supervisor:PhD Gabriele Orlando
+                                               University:University of Montpellier IDIL program
+                                               Internship began 19 January 2026 and ends on 27 July 2026
+                                               Montpellier 2026
+                                               Laboratory and Group:LPHI(Laboratory of Pathogens and Host Immunity)-Computational Systems Biology Group
+Description:The goal of this script  is parameter optimization: the script tunes two scalars
+(MU,DELTA ) that scale shift Urry hydropathy scale respectively) so that the protein's Radius of Gyration matches the experimental target.
+                                                     Workflow
+1)Before this script is run the protein chain is simulated for mu=0 and delta=0 for 10 ns to have a stable configuration.The script used can be modified for 
+ from the Single Chain MD simulation script uploaded here to restore the bead positions, velocities, and the thermostat state, together with the current force-field 
+parameters MU and DELTA in .npz file.
+2) Each iteration has two phases.First a non-differentiable production run (2ps NVT steps at 300 K) lets the chain explore conformations under 
+the current μ,Δ and gives a fresh, equilibrated starting state. Then a differentiable rollout re-runs for 1ps(10 k steps dt=0.0001ps) at 300K from that state, recording
+Rg(Radius of gyration) every 50 steps, and computes a loss = (mean Rg − target)². Gradients of this loss with respect to μ and Δ are obtained by backpropagating through 
+ all 10,000 integrator steps, and an optimizer updates the parameters (kept inside fixed bounds by clipping).
+3)This loop repeats until the production-MD Rg falls within ±0.01 nm
+of the target, at which point the script does a final cool down run with the best parameters, saves the optimized parameters and final state, 
+and plots the convergence of loss parameters, and Rg.
+
+The protein model is based on HPS Urry Coar
+se Grained model with resolution 1 bead 1 amino acid see the paper : 
+[1] Dignon GL, Zheng W, Kim YC, Best RB, Mittal J. "Sequence determinants of protein phase
+      behavior from a coarse-grained model." PLoS Comput Biol, 2018.
+[2] Regy RM, Thompson J, Kim YC, Mittal J. "Improved coarse-grained model for studying
+      sequence dependent phase separation of disordered proteins." Protein Science, 2021.
+      (Urry hydrophobicity scale.)
+
+"""
+
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import random, lax
+from jax_md import space, simulate, energy
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import optax
+import os
+
+jax.config.update("jax_enable_x64", True)
+
+
+# 0.  CHECKPOINT TO LOAD
+
+CHECKPOINT_PREFIX = "prod_final"   # loads  prod_final_state.npz
+
+RESUME_OPT        = False
+RESUME_OPT_PREFIX = "opt_ckpt_0040"
+
+
+# 1.  FORCE-FIELD PARAMETERS
+
+MU_INIT    = 0.0
+DELTA_INIT = 0.0
+
+LJ_EPS       = 0.8368 # kJmol-1
+D=80       #Dielectric constant 
+R_CUT_LJ     = 2.0
+R_CUT_YUK    = 3.5
+K_BOND       = 4000.0     #the stifness is k_b=2*K_BOND_AA computed in JAX-MD  energy.simple_spring_bond   #unit kJ mol−1 nm−2 
+R0_BOND      = 0.381
+YUKAWA_PRE   = 1.38935 / D  #Equation form 1/(4πD)
+YUKAWA_KAPPA = 1.0  # Kappa = 1.0 nm-1 (≈100 mM salt)
+DT           = 1e-4 #ps
+TEMPERATURE  = 300.0#K
+KT           = TEMPERATURE * 0.008314
+CHAIN_LENGTH = 5
+TAU          = 200.0 * DT        # thermostat relaxation time
+
+TARGET_RG    = 3.245
+CONVERGE_TOL = 0.01
+
+LAMBDA_URRY = {
+    "TRP":0.946, "TYR":0.865, "PHE":1.0, "HIS":0.514,
+    "PRO":1.0, "LEU":0.973, "ILE":0.973, "MET":0.838, 
+    "VAL":0.892, "CYS":0.595, "ALA":0.730, "ASN":0.432,
+    "SER":0.595, "THR":0.676, "GLY":0.649, "ARG":0,
+    "GLN":0.514, "LYS":0.514, "ASP":0.378, "GLU":0.459
+}
+MASS_AA = {
+    "ALA": 71.08, "ARG": 156.20, "ASN": 114.10, "ASP": 115.10,
+    "CYS": 103.10, "GLN": 128.10, "GLU": 129.10, "GLY": 57.05,
+    "HIS": 137.10, "ILE": 113.20, "LEU": 113.20, "LYS": 128.20,
+    "MET": 131.20, "PHE": 147.20, "PRO": 97.12, "SER": 87.08,
+    "THR": 101.10, "TRP": 186.20, "TYR": 163.20, "VAL": 99.07,
+}
+CHARGE_AA = {
+    "ALA": 0.0, "ARG": +1.0, "ASN": 0.0, "ASP": -1.0,
+    "CYS": 0.0, "GLN": 0.0, "GLU": -1.0, "GLY": 0.0,
+    "HIS": 0.5, "ILE": 0.0, "LEU": 0.0, "LYS": +1.0,
+    "MET": 0.0, "PHE": 0.0, "PRO": 0.0, "SER": 0.0,
+    "THR": 0.0, "TRP": 0.0, "TYR": 0.0, "VAL": 0.0,
+}
+SIGMA_AA = {
+    "ALA": 0.504, "ARG": 0.656, "ASN": 0.568, "ASP": 0.558,
+    "CYS": 0.548, "GLN": 0.602, "GLU": 0.592, "GLY": 0.450,
+    "HIS": 0.608, "ILE": 0.618, "LEU": 0.618, "LYS": 0.636,
+    "MET": 0.618, "PHE": 0.636, "PRO": 0.556, "SER": 0.518,
+    "THR": 0.562, "TRP": 0.678, "TYR": 0.646, "VAL": 0.586,
+}
+ONE_TO_THREE = {
+    'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS',
+    'Q':'GLN','E':'GLU','G':'GLY','H':'HIS','I':'ILE',
+    'L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO',
+    'S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL',
+}
+
+
+# 2.  SEQUENCE
+
+ALPHA_SYN_FASTA = (
+    "PASTE YOUR PROTEIN SEQUENCE HERE"
+)
+sequence = [ONE_TO_THREE[aa] for aa in ALPHA_SYN_FASTA]
+N        = len(sequence)
+print(f"Sequence length: {N} residues")
+
+# 3.  PER-PARTICLE ARRAYS
+sigma_arr  = jnp.array([SIGMA_AA[aa]    for aa in sequence])
+lambda_arr = jnp.array([LAMBDA_URRY[aa] for aa in sequence])
+charge_arr = jnp.array([CHARGE_AA[aa]   for aa in sequence])
+mass_arr   = jnp.array([MASS_AA[aa]     for aa in sequence])
+
+idx_i, idx_j = jnp.tril_indices(N, k=-3)
+idx_i = idx_i.astype(jnp.int32)
+idx_j = idx_j.astype(jnp.int32)
+
+bond_i = jnp.arange(N - 1, dtype=jnp.int32)
+bond_j = jnp.arange(1, N,  dtype=jnp.int32)
+bonds  = jnp.stack([bond_i, bond_j], axis=1)
+
+displacement_fn, shift_fn = space.free()
+
+bond_energy_fn = energy.simple_spring_bond(
+    displacement_fn, bonds,
+    length=jnp.full(N - 1, R0_BOND),
+    epsilon=K_BOND,
+)
+
+
+# 4.  ENERGY FUNCTION  (differentiable w.r.t. R, mu, delta)
+
+@jax.jit
+def yukawa_energy(R):
+    ri, rj  = R[idx_i], R[idx_j]
+    dr      = jax.vmap(displacement_fn)(ri, rj)
+    r       = jnp.linalg.norm(dr, axis=1)
+    qi, qj  = charge_arr[idx_i], charge_arr[idx_j]
+    r_safe  = jnp.maximum(r, 0.2)
+    e_pair  = (qi * qj * YUKAWA_PRE / r_safe) * jnp.exp(-YUKAWA_KAPPA * r_safe)
+    e_pair  = jnp.where(r < R_CUT_YUK, e_pair, 0.0)
+    return jnp.sum(e_pair)
+
+
+def total_energy(R, mu, delta):
+    """Full HPS-Urry energy; differentiable w.r.t. R, mu, and delta."""
+    bond_e  = bond_energy_fn(R)
+
+    ri, rj  = R[idx_i], R[idx_j]
+    dr      = jax.vmap(displacement_fn)(ri, rj)
+    r       = jnp.linalg.norm(dr, axis=1)
+    sig     = 0.5 * (sigma_arr[idx_i] + sigma_arr[idx_j])
+    lam     = jnp.clip(
+                  mu * 0.5 * (lambda_arr[idx_i] + lambda_arr[idx_j]) - delta,
+                  0.0, 1.0)
+    sr      = sig / jnp.maximum(r, 1e-6)
+    lj      = 4.0 * LJ_EPS * (sr**12 - sr**6)
+    r_min   = 2.0 ** (1.0 / 6.0) * sig
+    e_inner = lj + (1.0 - lam) * LJ_EPS
+    e_outer = lam * lj
+    e_pair  = jnp.where(r <= r_min, e_inner, e_outer)
+    e_pair  = jnp.where(r < R_CUT_LJ, e_pair, 0.0)
+    lj_e    = jnp.sum(e_pair)
+
+    return bond_e + lj_e + yukawa_energy(R)
+
+
+
+# 5.  DIFFERENTIABLE NVT NOSE-HOOVER STEP
+
+# the integrator is written explicitly so JAX can differentiate through it.
+# State tuple:  (R, V, xi, vxi)
+#   R   – positions          (N, 3)
+#   V   – velocities         (N, 3)
+#   xi  – thermostat coords  (chain_length,)
+#   vxi – thermostat momenta (chain_length,)
+#
+# NHC masses  Q_k = kT * tau^2  (standard choice)
+
+NHC_Q = KT * TAU ** 2 * jnp.ones(CHAIN_LENGTH)   # (chain_length,)
+
+
+def _nhc_half_step(vxi, xi, ke2, dt_half):
+    """
+    One half-step of the Nosé-Hoover chain thermostat.
+    ke2   – 2 × kinetic energy (scalar)
+    Returns updated (vxi, xi).
+    """
+    # Work from the outermost chain variable inward.
+    # G_k = (Q_{k-1} * vxi_{k-1}^2 - kT) / Q_k   for k > 0
+    # G_0 = (ke2 - 3*N*kT) / Q_0
+    dof = 3.0 * N
+
+    def _chain_step(carry, k):
+        vxi_local = carry
+        # Force on thermostat k
+        G = jnp.where(
+            k == 0,
+            (ke2 - dof * KT) / NHC_Q[0],
+            (NHC_Q[k - 1] * vxi_local[k - 1] ** 2 - KT) / NHC_Q[k],
+        )
+        # Update vxi[k] (Trotter / Yoshida factor = 1 here for simplicity)
+        vxi_new = vxi_local.at[k].set(
+            vxi_local[k] + dt_half * G
+        )
+        return vxi_new, None
+
+    # Forward sweep (outermost → innermost is conventional; we do 0 → L-1)
+    vxi_out, _ = lax.scan(_chain_step, vxi, jnp.arange(CHAIN_LENGTH))
+
+    # Update thermostat positions
+    xi_out = xi + dt_half * vxi_out
+
+    return vxi_out, xi_out
+
+
+def nhc_step(R, V, xi, vxi, mu, delta):
+    """
+    One full NVT NHC velocity-Verlet step.
+    Returns updated (R, V, xi, vxi).
+    """
+    dt      = DT
+    dt_half = 0.5 * dt
+    mass_3d = mass_arr[:, None]          # (N,1) for broadcasting
+
+    # ── 1. NHC half-kick (thermostat acts on velocities) ────────────────────
+    ke2        = jnp.sum(mass_arr * jnp.sum(V ** 2, axis=1))
+    scale      = jnp.exp(-dt_half * vxi[0])
+    V_scaled   = V * scale
+    ke2_scaled = ke2 * scale ** 2
+    vxi1, xi1  = _nhc_half_step(vxi, xi, ke2_scaled, dt_half)
+
+    # ── 2. Velocity half-kick from forces ───────────────────────────────────
+    F          = -jax.grad(total_energy, argnums=0)(R, mu, delta)   # (N,3)
+    V_half     = V_scaled + dt_half * F / mass_3d
+
+    # ── 3. Position full step ────────────────────────────────────────────────
+    R_new      = R + dt * V_half
+
+    # ── 4. Force at new positions + velocity full-kick ───────────────────────
+    F_new      = -jax.grad(total_energy, argnums=0)(R_new, mu, delta)
+    V_new      = V_half + dt_half * F_new / mass_3d
+
+    # ── 5. NHC second half-kick ──────────────────────────────────────────────
+    ke2_new    = jnp.sum(mass_arr * jnp.sum(V_new ** 2, axis=1))
+    vxi2, xi2  = _nhc_half_step(vxi1, xi1, ke2_new, dt_half)
+    scale2     = jnp.exp(-dt_half * vxi2[0])
+    V_final    = V_new * scale2
+
+    return R_new, V_final, xi2, vxi2
+
+
+
+# 6.  HELPERS
+
+def compute_rg(R):
+    com = jnp.mean(R, axis=0)
+    return jnp.sqrt(jnp.mean(jnp.sum((R - com) ** 2, axis=1)))
+
+
+def compute_temperature(V):
+    ke = 0.5 * jnp.sum(mass_arr[:, None] * V ** 2)
+    return (2.0 * ke) / (3.0 * N * 0.008314)
+
+
+def init_velocities(key, T=TEMPERATURE):
+    """Maxwell-Boltzmann initialisation."""
+    kT_local = T * 0.008314
+    std      = jnp.sqrt(kT_local / mass_arr[:, None])
+    V0       = random.normal(key, (N, 3)) * std
+    V0       = V0 - jnp.mean(V0, axis=0)    # zero COM momentum
+    return V0
+
+
+
+# 7.  SAVE / LOAD  (stores the flat (R, V, xi, vxi) tuple)
+
+def save_state_flat(R, V, xi, vxi, prefix, mu, delta, extra=None):
+    save_dict = dict(
+        position       = np.array(R),
+        velocity       = np.array(V),
+        chain_position = np.array(xi),
+        chain_momentum = np.array(vxi),
+        mu             = np.float64(mu),
+        delta          = np.float64(delta),
+    )
+    if extra:
+        save_dict.update(extra)
+    np.savez(f"{prefix}_state.npz", **save_dict)
+    np.save(f"{prefix}_positions.npy", np.array(R))
+    rg = float(compute_rg(jnp.array(R)))
+    print(f"{prefix}_state.npz  (Rg={rg:.4f} nm, μ={mu:.4f}, Δ={delta:.4f})")
+
+
+def load_state_flat(prefix, key=random.PRNGKey(0)):
+    """
+    Load (R, V, xi, vxi) from a flat _state.npz.
+
+    npz_path = f"{prefix}_state.npz"
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(
+            f"Cannot find '{npz_path}'.\n"
+            f"Make sure the file is in the same directory as this script,\n"
+            f"or set CHECKPOINT_PREFIX to the correct path prefix."
+        )
+
+    d   = np.load(npz_path, allow_pickle=True)
+    R   = jnp.array(d["position"],  dtype=jnp.float64)   # (N, 3)
+    mu  = float(d["mu"])    if "mu"    in d else MU_INIT
+    delta = float(d["delta"]) if "delta" in d else DELTA_INIT
+
+    # ── Velocity ──────────────────────────────────────────────────────────────
+    if "velocity" in d:
+        V = jnp.array(d["velocity"], dtype=jnp.float64)
+    elif "momentum" in d:
+        # old format stored momentum = mass * velocity
+        mom = jnp.array(d["momentum"], dtype=jnp.float64)
+        V   = mom / mass_arr[:, None]
+    else:
+        print(" No velocity/momentum found re-starting from Maxwell-Boltzmann.")
+        V   = init_velocities(key)
+
+    # Thermostat chain
+    if "chain_position" in d and d["chain_position"].shape == (CHAIN_LENGTH,):
+        # New flat format
+        xi  = jnp.array(d["chain_position"], dtype=jnp.float64)
+        vxi = jnp.array(d["chain_momentum"], dtype=jnp.float64)
+    else:
+        # Old format: chain was (chain_length, 2?) or nested; just zero it out
+        print(" NHC chain format mismatch — zeroing thermostat state.")
+        xi  = jnp.zeros(CHAIN_LENGTH, dtype=jnp.float64)
+        vxi = jnp.zeros(CHAIN_LENGTH, dtype=jnp.float64)
+
+    rg = float(compute_rg(R))
+    print(f"Loaded '{npz_path}'  Rg={rg:.4f} nm  μ={mu:.4f}  Δ={delta:.4f}")
+    return R, V, xi, vxi, mu, delta
+# 8.  NON-DIFFERENTIABLE PRODUCTION RUN  (warm-up / burn-in)
+
+# This is a plain lax.scan using our explicit NHC step.  jax.grad is NOT
+# called on this; it just advances the trajectory.
+
+def run_md_nondiff(R, V, xi, vxi, mu, delta, n_steps, key=None):
+    """Run n_steps of NHC-NVT MD without differentiating."""
+
+    def step(carry, _):
+        R_c, V_c, xi_c, vxi_c = carry
+        R_n, V_n, xi_n, vxi_n = nhc_step(R_c, V_c, xi_c, vxi_c, mu, delta)
+        return (R_n, V_n, xi_n, vxi_n), None
+
+    (R_f, V_f, xi_f, vxi_f), _ = lax.scan(
+        step, (R, V, xi, vxi), None, length=n_steps
+    )
+    return R_f, V_f, xi_f, vxi_f
+
+
+
+# 9.  DIFFERENTIABLE MD ROLLOUT  (backprop flows through this)
+# GRAD_INNER   – number of NHC steps to differentiate through.
+#                ↑ more = better gradient, more memory.
+# SNAPSHOT_EVERY – collect Rg every k steps.  The loss is mean(Rg) over
+#                  snapshots, which gives a smoother, lower-variance gradient
+#                  than using only the final frame.
+# USE_CHECKPOINT – jax.checkpoint on the inner step to save memory.
+
+GRAD_INNER     = 10000        # steps to backprop through  (tune to your GPU RAM)
+SNAPSHOT_EVERY = 50         # collect Rg every k steps   → GRAD_INNER/k snapshots
+USE_CHECKPOINT = True       # recommended for GRAD_INNER > 200
+
+assert GRAD_INNER % SNAPSHOT_EVERY == 0, \
+    "GRAD_INNER must be divisible by SNAPSHOT_EVERY"
+N_SNAPSHOTS = GRAD_INNER // SNAPSHOT_EVERY
+
+
+def make_diff_rollout(R_start, V_start, xi_start, vxi_start):
+    """
+    Returns a loss function that:
+      - Takes (mu, delta) as parameters.
+      - Runs GRAD_INNER real NHC-NVT steps starting from the given state.
+      - Collects positions every SNAPSHOT_EVERY steps.
+      - Returns  (loss, mean_Rg)  where  loss = (mean_Rg − TARGET_RG)².
+
+    Gradients w.r.t. mu and delta backpropagate through the entire MD scan.
+    """
+
+    def loss_fn(params):
+        mu    = params["mu"]
+        delta = params["delta"]
+
+        # Inner step: one NHC step, accumulate Rg at every SNAPSHOT_EVERY-th step
+        def micro_scan(carry, _):
+            """Runs SNAPSHOT_EVERY steps and returns the position at the end."""
+            R_c, V_c, xi_c, vxi_c = carry
+
+            def single_step(c, __):
+                R_s, V_s, xi_s, vxi_s = c
+                R_n, V_n, xi_n, vxi_n = nhc_step(R_s, V_s, xi_s, vxi_s, mu, delta)
+                return (R_n, V_n, xi_n, vxi_n), None
+
+            step_fn = jax.checkpoint(single_step) if USE_CHECKPOINT else single_step
+            (R_f, V_f, xi_f, vxi_f), _ = lax.scan(
+                step_fn, (R_c, V_c, xi_c, vxi_c),
+                None, length=SNAPSHOT_EVERY
+            )
+            rg_snap = compute_rg(R_f)
+            return (R_f, V_f, xi_f, vxi_f), rg_snap
+
+        # Outer scan collects one Rg per SNAPSHOT_EVERY block
+        _, rg_trace = lax.scan(
+            micro_scan,
+            (R_start, V_start, xi_start, vxi_start),
+            None,
+            length=N_SNAPSHOTS,
+        )
+
+        mean_rg = jnp.mean(rg_trace)
+        loss    = (mean_rg - TARGET_RG) ** 2
+        return loss, mean_rg
+
+    return loss_fn
+# 10. OPTIMISATION HYPERPARAMETERS
+
+PROD_INNER   = 20_000    # non-differentiable NVT steps between gradient updates
+OPT_LR       =5e-3
+MAX_OUTER    = 500
+GRAD_CLIP    = 1.0
+SAVE_EVERY   = 20
+
+MU_LO    = MU_INIT - 5;   MU_HI    = MU_INIT + 5
+DELTA_LO = DELTA_INIT - 5; DELTA_HI = DELTA_INIT + 5
+
+#Here parameters are clipped to stay at a specified range 
+def clip_params_hard(p):
+    return {
+        "mu":    jnp.clip(p["mu"],    MU_LO, MU_HI),
+        "delta": jnp.clip(p["delta"], DELTA_LO, DELTA_HI),
+    }
+
+
+def clip_grads(grads, max_norm=GRAD_CLIP):
+    leaves = jax.tree_util.tree_leaves(grads)
+    g_norm = jnp.sqrt(sum(jnp.sum(g ** 2) for g in leaves))
+    factor = jnp.minimum(1.0, max_norm / (g_norm + 1e-8))
+    return jax.tree_util.tree_map(lambda g: g * factor, grads)
+
+
+
+# 11. LOAD CHECKPOINT
+
+key = random.PRNGKey(0)
+key, load_key = random.split(key)
+
+print("=" * 70)
+print(f"Loading checkpoint: '{CHECKPOINT_PREFIX}_state.npz'")
+print("=" * 70)
+
+R_live, V_live, xi_live, vxi_live, mu_loaded, delta_loaded = \
+    load_state_flat(CHECKPOINT_PREFIX, key=load_key)
+
+if RESUME_OPT:
+    opt_npz = f"{RESUME_OPT_PREFIX}_state.npz"
+    if os.path.exists(opt_npz):
+        d_opt      = np.load(opt_npz)
+        MU_INIT    = float(d_opt["mu"])
+        DELTA_INIT = float(d_opt["delta"])
+        print(f"\n Resuming: μ={MU_INIT:.4f}  Δ={DELTA_INIT:.4f}  (from '{opt_npz}')")
+    else:
+        print(f"\n RESUME_OPT=True but '{opt_npz}' not found — "
+              f"starting fresh from μ={MU_INIT}  Δ={DELTA_INIT}")
+else:
+    # Use whatever was embedded in the checkpoint (may differ from MU_INIT)
+    MU_INIT    = mu_loaded
+    DELTA_INIT = delta_loaded
+    print(f"\n  Using checkpoint μ={MU_INIT:.4f}  Δ={DELTA_INIT:.4f}")
+
+print(f"  Starting Rg = {float(compute_rg(R_live)):.4f} nm")
+print(f"  Target  Rg  = {TARGET_RG} nm")
+
+
+# 12. INITIALISE OPTIMISER
+
+params    = {"mu": jnp.float64(MU_INIT), "delta": jnp.float64(DELTA_INIT)}
+optimizer = optax.adam(learning_rate=OPT_LR)
+opt_state = optimizer.init(params)
+
+best_loss  = float("inf")
+best_mu    = MU_INIT
+best_delta = DELTA_INIT
+history    = []    # (outer, mu, delta, rg_md, rg_rollout_mean, loss)
+
+
+# 13. MAIN LOOP:  production MD  →  differentiable MD rollout  →  Adam step
+
+print("\n" + "=" * 70)
+print("BACKPROP")
+print(f"  Target Rg      = {TARGET_RG} nm   (tol ±{CONVERGE_TOL} nm)")
+print(f"  Non-diff steps = {PROD_INNER:,}   Diff rollout = {GRAD_INNER:,} steps "
+      f"({N_SNAPSHOTS} Rg snapshots)")
+print(f"  Adam lr = {OPT_LR}   grad clip = {GRAD_CLIP}")
+print(f"  μ ∈ [{MU_LO:.2f}, {MU_HI:.2f}]   Δ ∈ [{DELTA_LO:.2f}, {DELTA_HI:.2f}]")
+print(f"  Max outer iterations = {MAX_OUTER}")
+print(f"  Checkpointing = {USE_CHECKPOINT}")
+print("=" * 70)
+hdr = (f"{'Iter':>5} | {'Rg_MD':>7} | {'Rg_roll':>7} | "
+       f"{'Loss':>9} | {'μ':>8} | {'Δ':>8} | {'∇μ':>8} | {'∇Δ':>8} | Note")
+print(hdr)
+print("-" * len(hdr))
+
+for outer in range(MAX_OUTER):
+    mu_now    = float(params["mu"])
+    delta_now = float(params["delta"])
+
+    # ── A: non-differentiable production MD to explore conformation space ────
+    key, subkey = random.split(key)
+    R_live, V_live, xi_live, vxi_live = run_md_nondiff(
+        R_live, V_live, xi_live, vxi_live,
+        mu_now, delta_now,
+        n_steps = PROD_INNER,
+    )
+    rg_md = float(compute_rg(R_live))
+
+
+
+    R_sg   = jax.lax.stop_gradient(R_live)
+    V_sg   = jax.lax.stop_gradient(V_live)
+    xi_sg  = jax.lax.stop_gradient(xi_live)
+    vxi_sg = jax.lax.stop_gradient(vxi_live)
+
+    loss_fn      = make_diff_rollout(R_sg, V_sg, xi_sg, vxi_sg)
+    val_and_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
+
+    (loss_val, rg_roll_val), grads_raw = val_and_grad(params)
+
+    loss_now  = float(loss_val)
+    rg_roll   = float(rg_roll_val)
+    g_mu      = float(grads_raw["mu"])
+    g_delta   = float(grads_raw["delta"])
+
+    grads_clipped      = clip_grads(grads_raw)
+    updates, opt_state = optimizer.update(grads_clipped, opt_state, params)
+    params             = optax.apply_updates(params, updates)
+    params             = clip_params_hard(params)
+
+    # ── Tracking ─────────────────────────────────────────────────────────────
+    note = ""
+    if loss_now < best_loss:
+        best_loss  = loss_now
+        best_mu    = mu_now
+        best_delta = delta_now
+        note       = "← BEST"
+
+    history.append((outer, mu_now, delta_now, rg_md, rg_roll, loss_now))
+
+    print(f"{outer:>5} | {rg_md:>7.4f} | {rg_roll:>7.4f} | "
+          f"{loss_now:>9.5f} | {mu_now:>8.4f} | {delta_now:>8.4f} | "
+          f"{g_mu:>+8.4f} | {g_delta:>+8.4f} | {note}")
+
+    # ── Checkpoint ──────────
+    if (outer + 1) % SAVE_EVERY == 0:
+        ck = f"opt_ckpt_{outer+1:04d}"
+        save_state_flat(R_live, V_live, xi_live, vxi_live, ck, mu_now, delta_now,
+                        extra={"outer_step":  np.int64(outer),
+                               "loss":        np.float64(loss_now),
+                               "rg_md":       np.float64(rg_md),
+                               "rg_rollout":  np.float64(rg_roll)})
+        np.save("opt_history.npy", np.array(history))
+
+    # ── Convergence ───────────────────────────────────────────────────────────
+    if abs(rg_md - TARGET_RG) < CONVERGE_TOL:
+        print(f" Converged! Rg_MD = {rg_md:.4f} nm  "
+              f"(target {TARGET_RG} ± {CONVERGE_TOL} nm)  at iter {outer}")
+        break
+
+
+# 14. FINAL SUMMARY + CHECKPOINT
+
+print("\n" + "=" * 70)
+print(f"  Best μ    = {best_mu:.6f}")
+print(f"  Best Δ    = {best_delta:.6f}")
+print(f"  Best loss = {best_loss:.6f}")
+print("=" * 70)
+
+hist_arr = np.array(history)
+np.save("opt_history.npy", hist_arr)
+
+
+print(f"\nCool-down run with best params (μ={best_mu:.4f}, Δ={best_delta:.4f}) ...")
+key, subkey = random.split(key)
+R_final, V_final, xi_final, vxi_final = run_md_nondiff(
+    R_live, V_live, xi_live, vxi_live,
+    best_mu, best_delta, n_steps=50_000
+)
+save_state_flat(R_final, V_final, xi_final, vxi_final,
+                "opt_final", best_mu, best_delta,
+                extra={"target_rg": np.float64(TARGET_RG),
+                       "best_loss": np.float64(best_loss)})
+print(f"   Final Rg = {float(compute_rg(R_final)):.4f} nm  (target = {TARGET_RG} nm)")
+
+# 15. CONVERGENCE PLOTS
+
+if len(hist_arr) > 1:
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+    iters = hist_arr[:, 0]
+
+    axes[0].plot(iters, hist_arr[:, 5], 'b-o', ms=3)
+    axes[0].set_xlabel("Iteration"); axes[0].set_ylabel("Loss")
+    axes[0].set_title("Loss (Rg − target)²"); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(iters, hist_arr[:, 1], 'r-o', ms=3, label="μ")
+    axes[1].plot(iters, hist_arr[:, 2], 'g-o', ms=3, label="Δ")
+    axes[1].set_xlabel("Iteration"); axes[1].set_ylabel("Value")
+    axes[1].set_title("μ and Δ"); axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(iters, hist_arr[:, 3], 'c-o', ms=3, label="Rg (MD)")
+    axes[2].plot(iters, hist_arr[:, 4], 'm--o', ms=3, label="Rg (rollout mean)")
+    axes[2].axhline(TARGET_RG, color='k', ls='--', lw=1.5,
+                    label=f"Target = {TARGET_RG}")
+    axes[2].set_xlabel("Iteration"); axes[2].set_ylabel("Rg (nm)")
+    axes[2].set_title("Rg evolution"); axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
+    sc = axes[3].scatter(hist_arr[:, 1], hist_arr[:, 2],
+                         c=iters, cmap='viridis', s=25)
+    axes[3].scatter([best_mu], [best_delta], c='red', s=100,
+                    marker='*', label='Best', zorder=5)
+    axes[3].set_xlabel("μ"); axes[3].set_ylabel("Δ")
+    axes[3].set_title("Parameter path"); axes[3].legend(fontsize=8)
+    plt.colorbar(sc, ax=axes[3], label="Iteration")
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("opt_convergence.png", dpi=150)
+    print("✅ opt_convergence.png saved")
+
+print("\n=== DONE ===")
