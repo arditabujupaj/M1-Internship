@@ -74,7 +74,7 @@ DELTA       = 0.08
 LJ_EPS      = 0.8368      # kJmol-1
 R_CUT_LJ    = 2.0
 R_CUT_YUK   = 3.5
-K_BOND      = 4000.0      # kJ mol−1 nm−2 
+K_BOND      = 4000.0    #the stifness is k_b=2*K_BOND_AA computed in JAX-MD  energy.simple_spring_bond   #unit kJ mol−1 nm−2 
 D           = 80           #Dielectric constant 
 R0_BOND     = 0.381  #nm
 YUKAWA_PRE  = 1.38935 / D  #Equation form 1/(4πD) 
