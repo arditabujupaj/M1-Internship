@@ -647,6 +647,6 @@ if len(hist_arr) > 1:
 
     plt.tight_layout()
     plt.savefig("opt_convergence.png", dpi=150)
-    print("✅ opt_convergence.png saved")
+    print("opt_convergence.png saved")
 
 print("\n=== DONE ===")
