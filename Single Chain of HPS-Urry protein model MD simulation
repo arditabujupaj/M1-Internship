@@ -1,0 +1,279 @@
+
+"""THIS IS A SCRIPT TO RUN MD SIMULATION OF COARSE GRAIN HPS-URRY MODEL WHICH COMPUTES THE RADIUS OF GYRATION OF SINGLE CHAIN PROTEIN WRITTEN IN JAX and JAX-MD
+                                               M1 Internship report code for MD simulation workflow
+                                               Author:Ardite Bujupaj M1 Quantitative Biology
+                                               Supervisor:PhD Gabriele Orlando
+                                               University:University of Montpellier IDIL program
+                                              Internship began 19 January 2026 and ends on 27 July 2026
+                                               Laboratory and Group:LPHI(Laboratory of Pathogens and Host Immunity)-Computational Systems Biology Group
+                                                  The workflow of the process :
+The protein chain starts at t=0 as a straight, rod-like structure (like a stretched stick) made of beads representing amino acids.
+The equilibration which brings the protein to a more stable low energy system from the artificial one .It is conducted at 600K and lasts differently for each protein
+The production where the protein moves and folds naturally according to the HPS-Urry model 
+This script computes the Radius of Gyration of the IDP as a measurable quantitity while it also records the energies,forces, temperatures during the simulation and bond lengths.
+"""
+
+
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from functools import partial
+from jax_md import space, simulate, energy
+from jax import random
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+jax.config.update("jax_enable_x64", True)
+
+
+# 1.  FORCE-FIELD PARAMETERS
+
+
+LAMBDA_URRY = {
+    "TRP":0.946, "TYR":0.865, "PHE":1.0, "HIS":0.514,
+    "PRO":1.0, "LEU":0.973, "ILE":0.973, "MET":0.838, 
+    "VAL":0.892, "CYS":0.595, "ALA":0.730, "ASN":0.432,
+    "SER":0.595, "THR":0.676, "GLY":0.649, "ARG":0,
+    "GLN":0.514, "LYS":0.514, "ASP":0.378, "GLU":0.459
+}
+
+
+
+MASS_AA = {
+    "ALA": 71.08, "ARG": 156.20, "ASN": 114.10, "ASP": 115.10,
+    "CYS": 103.10, "GLN": 128.10, "GLU": 129.10, "GLY": 57.05,
+    "HIS": 137.10, "ILE": 113.20, "LEU": 113.20, "LYS": 128.20,
+    "MET": 131.20, "PHE": 147.20, "PRO": 97.12, "SER": 87.08,
+    "THR": 101.10, "TRP": 186.20, "TYR": 163.20, "VAL": 99.07,
+}
+
+CHARGE_AA = {
+    "ALA": 0.0, "ARG": +1.0, "ASN": 0.0, "ASP": -1.0,
+    "CYS": 0.0, "GLN": 0.0, "GLU": -1.0, "GLY": 0.0,
+    "HIS": 0.5, "ILE": 0.0, "LEU": 0.0, "LYS": +1.0,
+    "MET": 0.0, "PHE": 0.0, "PRO": 0.0, "SER": 0.0,
+    "THR": 0.0, "TRP": 0.0, "TYR": 0.0, "VAL": 0.0,
+}
+
+SIGMA_AA = {
+    "ALA": 0.504, "ARG": 0.656, "ASN": 0.568, "ASP": 0.558,
+    "CYS": 0.548, "GLN": 0.602, "GLU": 0.592, "GLY": 0.450,
+    "HIS": 0.608, "ILE": 0.618, "LEU": 0.618, "LYS": 0.636,
+    "MET": 0.618, "PHE": 0.636, "PRO": 0.556, "SER": 0.518,
+    "THR": 0.562, "TRP": 0.678, "TYR": 0.646, "VAL": 0.586,
+}
+"""The values of the parameters of amino acids are taken from :https://github.com/Roshan-M-Regy/slab_builder/blob/main/FUS_LC_example/stats_module.dat
+that are used for the Regy RM, Thompson J, Kim YC, Mittal J. Improved coarse-grained model for studying sequence dependent
+phase separation of disordered proteins. Protein Sci. 2021 Jul;30(7):1371-1379. doi: 10.1002/pro.4094. Epub
+2021 May 24. PMID: 33934416; PMCID: PMC8197430 paper"""
+
+MU          = 1.0
+DELTA       = 0.08
+LJ_EPS      = 0.8368      # kJmol-1
+R_CUT_LJ    = 2.0
+R_CUT_YUK   = 3.5
+K_BOND      = 4000.0      # kJ mol−1 nm−2 
+D           = 80           #Dielectric constant 
+R0_BOND     = 0.381  #nm
+YUKAWA_PRE  = 1.38935 / D  #Equation form 1/(4πD) 
+YUKAWA_KAPPA = 1.0 # Kappa = 1.0 nm-1 (≈100 mM salt)
+DT          = 1e-4 #0.0001 PS
+TEMPERATURE = 300.0 #K
+KT          = TEMPERATURE * 0.008314
+
+
+# 2.  Protein FASTA
+
+ALPHA_SYN_FASTA = (
+"PASTE YOUR FASTA FILE HERE"
+)
+
+ONE_TO_THREE = {
+    'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS',
+    'Q':'GLN','E':'GLU','G':'GLY','H':'HIS','I':'ILE',
+    'L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO',
+    'S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL',
+}
+
+sequence = [ONE_TO_THREE[aa] for aa in ALPHA_SYN_FASTA]
+N = len(sequence)
+print(f"Sequence length: {N}")
+print(f"First 5: {sequence[:5]}")
+
+
+# 3.  BUILD PER-PARTICLE ARRAYS
+
+sigma_arr   = jnp.array([SIGMA_AA[aa]   for aa in sequence])
+lambda_arr  = jnp.array([LAMBDA_URRY[aa] for aa in sequence])
+charge_arr  = jnp.array([CHARGE_AA[aa]  for aa in sequence])
+mass_arr    = jnp.array([MASS_AA[aa]    for aa in sequence])
+
+idx_i, idx_j = jnp.tril_indices(N, k=-3)
+idx_i = idx_i.astype(jnp.int32)
+idx_j = idx_j.astype(jnp.int32)
+bond_i = jnp.arange(N - 1, dtype=jnp.int32)
+bond_j = jnp.arange(1, N, dtype=jnp.int32)
+bonds  = jnp.stack([bond_i, bond_j], axis=1)
+
+
+# 4.  INITIAL CONFIGURATION AS ROD LIKE CHAIN
+
+def build_linear_chain(N, r0):
+    z = jnp.arange(N, dtype=jnp.float64) * r0
+    xyz = jnp.zeros((N, 3)).at[:, 2].set(z)
+    return xyz - jnp.mean(xyz, axis=0)
+
+positions_init = build_linear_chain(N, R0_BOND)
+chain_extent   = N * R0_BOND
+box_size       = chain_extent * 3.0
+box            = jnp.array([box_size, box_size, box_size])
+
+displacement_fn, shift_fn = space.free()
+
+
+# 5.  ENERGY FUNCTIONS
+bond_energy_fn = energy.simple_spring_bond(
+    displacement_fn, bonds, length=jnp.full(N - 1, R0_BOND), epsilon=K_BOND
+)
+
+@jax.jit
+def ashbaugh_hatch_energy(R):
+    ri, rj = R[idx_i], R[idx_j]
+    dr = jax.vmap(displacement_fn)(ri, rj)
+    r = jnp.linalg.norm(dr, axis=1)
+    sig = 0.5*(sigma_arr[idx_i]+sigma_arr[idx_j])
+    lam = jnp.clip(MU*0.5*(lambda_arr[idx_i]+lambda_arr[idx_j]) - DELTA)#Here  λij = μ*λ0(ij) − ∆ is applied where λ0 is normalized hydropathy scales that range from 0 to 1
+    sr = sig / jnp.maximum(r, 1e-6)
+    lj = 4.0*LJ_EPS*(sr**12 - sr**6)
+    r_min = 2.0**(1/6.0) * sig
+    e_inner = lj + (1.0 - lam)*LJ_EPS
+    e_outer = lam*lj
+    e_pair  = jnp.where(r <= r_min, e_inner, e_outer)
+    e_pair  = jnp.where(r < R_CUT_LJ, e_pair, 0.0)
+    return jnp.sum(e_pair)
+
+@jax.jit
+
+def yukawa_energy(R):
+    ri, rj = R[idx_i], R[idx_j]
+    dr = jax.vmap(displacement_fn)(ri, rj)
+    r = jnp.linalg.norm(dr, axis=1)
+    qi, qj = charge_arr[idx_i], charge_arr[idx_j]
+    r_safe = jnp.maximum(r, 0.2)
+    e_pair = (qi*qj*YUKAWA_PRE/r_safe) * jnp.exp(-YUKAWA_KAPPA*r_safe)
+    e_pair = jnp.where(r < R_CUT_YUK, e_pair, 0.0)
+    return jnp.sum(e_pair)
+
+@jax.jit
+def total_energy(R, **kwargs):
+    return bond_energy_fn(R) + ashbaugh_hatch_energy(R) + yukawa_energy(R)
+
+@jax.jit
+def total_forces(R, **kwargs):
+    return -jax.grad(total_energy)(R, **kwargs)
+
+def compute_rg(R):
+    com = jnp.mean(R, axis=0)
+    return float(jnp.sqrt(jnp.mean(jnp.sum((R - com)**2, axis=1))))
+
+def check_bonds(R):
+    dr  = jax.vmap(displacement_fn)(R[bond_i], R[bond_j])
+    bls = jnp.linalg.norm(dr, axis=1)
+    return float(jnp.mean(bls)), float(jnp.max(bls)), float(jnp.min(bls))
+
+#This checks the temperature during the simulation
+def compute_temperature(state):
+    ke = 0.5 * jnp.sum(state.momentum**2 / mass_arr[:, None])
+    return float((2.0 * ke) / (3.0 * N * 0.008314))
+
+# 6.  MD EQUILIBRATION — Stage 1
+
+print(" Equilibration Stage began ")
+kT_hot   = 600.0 * 0.008314
+init_fn, apply_fn = simulate.nvt_langevin(
+    total_energy, shift_fn, dt=DT, kT=kT_hot, gamma=0.1#ps-1
+)
+key   = random.PRNGKey(42)
+state = init_fn(key, positions_init, mass=mass_arr)
+apply_jit = jax.jit(apply_fn)
+
+rg_traj_hot = []
+for step in range(100_000_0): #STEPS OF EQUILIBRATION AT DT= 1E-4PS
+    key, sk = random.split(key)
+    state = apply_jit(state, key=sk)
+    if step % 10_000 == 0: #Record the data every ps
+        R  = state.position
+        rg = compute_rg(R)
+        bm, bx, bn = check_bonds(R)
+        e  = float(total_energy(R))
+        forces = total_forces(R)
+        force_mag = jnp.linalg.norm(forces, axis=1)
+        T_inst = compute_temperature(state)          
+        rg_traj_hot.append(rg)
+        print(f"Step {step:7d} | E={e:12.2f} | Rg={rg:.4f} nm | "
+              f"bond mean={bm:.4f} max={bx:.4f} min={bn:.4f} | "
+              f"T={T_inst:.1f} K | "               
+              f"force mean={float(jnp.mean(force_mag)):.4f} "
+              f"max={float(jnp.max(force_mag)):.4f} kJ/mol/nm")
+
+
+# 7.  MD PRODUCTION STAGE Stage 2
+
+print(" Production stage began )
+init_fn, apply_fn = simulate.nvt_langevin(
+    total_energy, shift_fn, dt=DT, kT=KT, gamma=0.1#ps-1
+)
+state = init_fn(key, state.position, mass=mass_arr)
+apply_jit = jax.jit(apply_fn)
+
+rg_traj, step_traj = [], []
+for step in range(1_000_000_00): #STEPS OF PRODUCTION AT DT= 1E-4PS
+    key, sk = random.split(key)
+    state = apply_jit(state, key=sk)
+    if step % 20_000 == 0:
+        R  = state.position
+        rg = compute_rg(R)
+        bm, bx, bn = check_bonds(R)
+        e  = float(total_energy(R))
+        forces = total_forces(R)
+        force_mag = jnp.linalg.norm(forces, axis=1)
+        T_inst = compute_temperature(state)      
+        rg_traj.append(rg)
+        step_traj.append(step)
+        print(f"Step {step:7d} | E={e:12.2f} | Rg={rg:.4f} nm | "
+              f"bond mean={bm:.4f} max={bx:.4f} min={bn:.4f} | "
+              f"T={T_inst:.1f} K | "              
+              f"force mean={float(jnp.mean(force_mag)):.4f} "
+              f"max={float(jnp.max(force_mag)):.4f} kJ/mol/nm")
+
+
+# 8.  FINAL FORCES PRINT
+
+R = state.position
+forces = total_forces(R)
+print(f"\nComputed forces on all residues (first 10 shown):")
+for i in range(min(10, N)):
+    print(f"Residue {i+1:3d} ({sequence[i]}): fx={forces[i,0]:10.4f}, "
+          f"fy={forces[i,1]:10.4f}, fz={forces[i,2]:10.4f} kJ/mol/nm")
+
+
+# 9.  Rg STATISTICS
+
+rg_mean = float(np.mean(rg_traj[len(rg_traj)//2:]))
+rg_std  = float(np.std(rg_traj[len(rg_traj)//2:]))
+print(f"\n{'='*60}")
+print(f"RNASea Rg (last 50% of trajectory):")
+print(f"  Mean : {rg_mean:.4f} nm")
+print(f"  Std  : {rg_std:.4f} nm")
+print(f"  Expected (experiment ~3.245 nm for Rnasea IDP)")
+print(f"{'='*60}")
+
+bm, bx, bn = check_bonds(state.position)
+print(f"\nFinal bond lengths: mean={bm:.4f}, max={bx:.4f}, min={bn:.4f} nm")
+print(f"  (should all be close to {R0_BOND} nm)")
+
+
+
+ 
