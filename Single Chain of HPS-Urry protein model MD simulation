@@ -77,7 +77,7 @@ R_CUT_YUK   = 3.5
 K_BOND      = 4000.0    #the stifness is k_b=2*K_BOND_AA computed in JAX-MD  energy.simple_spring_bond   #unit kJ mol−1 nm−2 
 D           = 80           #Dielectric constant 
 R0_BOND     = 0.381  #nm
-YUKAWA_PRE  = 1.38935 / D  #Equation form 1/(4πD) 
+YUKAWA_PRE  = 1.38935 / D # kJ·nm·mol⁻¹·e⁻² 
 YUKAWA_KAPPA = 1.0 # Kappa = 1.0 nm-1 (≈100 mM salt)
 DT          = 1e-4 #0.0001 PS
 TEMPERATURE = 300.0 #K
