@@ -17,7 +17,7 @@ parameters MU and DELTA in .npz file.
 2) Each iteration has two phases.First a non-differentiable production run (2ps NVT steps at 300 K) lets the chain explore conformations under 
 the current μ,Δ and gives a fresh, equilibrated starting state. Then a differentiable rollout re-runs for 1ps(10 k steps dt=0.0001ps) at 300K from that state, recording
 Rg(Radius of gyration) every 50 steps, and computes a loss = (mean Rg − target)². Gradients of this loss with respect to μ and Δ are obtained by backpropagating through 
- all 10,000 integrator steps, and an optimizer updates the parameters (kept inside fixed bounds by clipping).
+ all 10,000 integrator steps, and an optimizer updates the parameters.
 3)This loop repeats until the production-MD Rg falls within ±0.01 nm
 of the target, at which point the script does a final cool down run with the best parameters, saves the optimized parameters and final state, 
 and plots the convergence of loss parameters, and Rg.
