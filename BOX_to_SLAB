@@ -1,0 +1,808 @@
+                                                                PART 1:BOX COMPRESSION ,SLAB BOX FORMATION
+                         M1 Internship report code for MD simulation workflow of Slab coexistence simulation of IDP liquid-liquid phase separation
+                                   (Rearranged 10Amino acids 1 bead resolution HPS-Urry CG model),BOX COMPRESSION ,SLAB BOX FORMATION)
+                                                   Author:Ardite Bujupaj M1 Quantitative Biology
+                                                   Supervisor:PhD Gabriele Orlando
+                                                   University of Montpellier IDIL program
+                                                   Internship began 19 January 2026 and ends on 27 July 2026
+                                                   Laboratory and Group:LPHI(Laboratory of Pathogens and Host Immunity)-Computational Systems Biology Group
+
+The model and slab-coexistence methodology follow:
+  [1] Dignon GL, Zheng W, Kim YC, Best RB, Mittal J. "Sequence determinants of protein phase
+      behavior from a coarse-grained model." PLoS Comput Biol, 2018.
+  [2] Regy RM, Thompson J, Kim YC, Mittal J. "Improved coarse-grained model for studying
+      sequence dependent phase separation of disordered proteins." Protein Science, 2021.
+      (Urry hydrophobicity scale.)
+#####################################################################      THE WORKFLOW      #####################################################################
+LLPS Coarse-Grained Simulation :BOX Shrinking and Slab formation
+
+
+ 1) Create a single chain initial configuration as a linear polymer chain
+ 2) Replicate into NX×NY×NZ grid (the box is big enough that there are no overlaps and is decided by the user for each protein)
+ 3) box_resize + NVT simultaneously .Here box shrinks linearly while running  NVT  simultaneously so the chains collapse naturally.
+ 4) extend()  From the compressed box this function extends it to z direction to form a slab like structure.
+Those two next steps are not run here.You put 1 as steps to equilibration and production so the work continues and then you run the run the command to save the final 
+configuration of the  protein as BOXcheckpoint_manual.npz which is a slab with concentrated chains in the center .
+ 7) Production NVT: phase separation develops #THIS IS NOT RUN HERE BUT IN THE NEXT SCRIPT .
+ 8) Analysis: density profile, coexistence concentrations #THIS IS NOT RUN HERE BUT IN THE NEXT SCRIPT .
+  
+
+ 10 AA residues = 1 CG bead
+  mass    : Σ mᵢ
+  sigma   : (Σ σᵢ³)^(1/3)   volume-additive
+  lambda  : Σ(mᵢλᵢ)/Σmᵢ     mass-weighted hydrophobicity
+  charge  : Σ qᵢ             algebraic sum
+"""
+
+import sys, os, time
+import numpy as np
+
+os.environ["JAX_ENABLE_X64"] = "1"
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+from jax import random, vmap, grad, jit
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# SECTION 1 — FORCE-FIELD LOOKUP TABLES  (HPS model, Dignon 2018)
+
+LAMBDA_URRY = {
+    "TRP":0.946, "TYR":0.865, "PHE":1.0, "HIS":0.514,
+    "PRO":1.0, "LEU":0.973, "ILE":0.973, "MET":0.838, 
+    "VAL":0.892, "CYS":0.595, "ALA":0.730, "ASN":0.432,
+    "SER":0.595, "THR":0.676, "GLY":0.649, "ARG":0,
+    "GLN":0.514, "LYS":0.514, "ASP":0.378, "GLU":0.459
+}
+MASS_AA = {
+    "ALA": 71.08, "ARG": 156.20, "ASN": 114.10, "ASP": 115.10,
+    "CYS": 103.10, "GLN": 128.10, "GLU": 129.10, "GLY": 57.05,
+    "HIS": 137.10, "ILE": 113.20, "LEU": 113.20, "LYS": 128.20,
+    "MET": 131.20, "PHE": 147.20, "PRO": 97.12, "SER": 87.08,
+    "THR": 101.10, "TRP": 186.20, "TYR": 163.20, "VAL": 99.07,
+}
+CHARGE_AA = {
+    "ALA": 0.0, "ARG": +1.0, "ASN": 0.0, "ASP": -1.0,
+    "CYS": 0.0, "GLN": 0.0, "GLU": -1.0, "GLY": 0.0,
+    "HIS": 0.5, "ILE": 0.0, "LEU": 0.0, "LYS": +1.0,
+    "MET": 0.0, "PHE": 0.0, "PRO": 0.0, "SER": 0.0,
+    "THR": 0.0, "TRP": 0.0, "TYR": 0.0, "VAL": 0.0,
+}
+SIGMA_AA = {
+    "ALA": 0.504, "ARG": 0.656, "ASN": 0.568, "ASP": 0.558,
+    "CYS": 0.548, "GLN": 0.602, "GLU": 0.592, "GLY": 0.450,
+    "HIS": 0.608, "ILE": 0.618, "LEU": 0.618, "LYS": 0.636,
+    "MET": 0.618, "PHE": 0.636, "PRO": 0.556, "SER": 0.518,
+    "THR": 0.562, "TRP": 0.678, "TYR": 0.646, "VAL": 0.586,
+}
+
+
+# SECTION 2 — USER PARAMETERS  (edit these)
+
+
+# --- Coarse-graining ---
+CG_STRIDE     = 10         #10 AA residues per 1 CG bead
+
+# --- System replication (total chains = NX*NY*NZ) ---
+NX, NY, NZ    = 5, 5, 4     # 100 chains 
+# --- Box sizes ---
+BOX_CUBE_NM   = 15.0        # target cubic box after resize 
+SLAB_Z_NM     = 280.0       # slab Z length after extend    
+
+#  Resize stage 
+
+# Rule: shrink rate < 20 nm/ns  →  Steps of shrinking are counted in this way:steps > (init_box - 15) / 20 * 1000 / DT
+# We set this automatically below after computing init_box_L.
+# Override here if needed:
+RESIZE_STEPS_OVERRIDE = None   # set e.g. 2_000_000 to force a value
+
+# --- Equilibration & production ---
+EQUIL_STEPS      = 1  # NVT after slab extension to equilibrate but don't run here as we run in the other script just set 1 to run the code and generate the file .
+PRODUCTION_STEPS = 1 # We don't run production here as we run in the other script just set 1 to run the code and generate the file .
+LOG_EVERY        = 1
+PROFILE_BINS     = 200
+
+# --- Force field ---
+MU            = 1.0
+DELTA         = 0.08
+D             = 80           #Dielectric constant 
+LJ_EPS        = 0.8368       # kJ/mol
+R_CUT_LJ      = 2.0          # nm
+R_CUT_YUK     = 3.5          # nm
+K_BOND_AA     = 8368.0       # kJ/mol/nm² 
+R0_BOND_AA    = 0.38         # nm   when arranged to 10 amino acids to 1 bead it will be 3.8nm       
+YUKAWA_PRE    = 1.73136      # kJ·nm/mol/e² 
+YUKAWA_KAPPA  = 1.0          # nm⁻¹
+
+# --- Integrator ---
+DT            = 0.01         # ps  
+T_RESIZE      = 300.0        # K   
+T_PROD        = 300.0        # K  
+GAMMA_SCALE   = 1.0 / 1000.0 # ps⁻¹/Da  
+
+# --- Analysis ---
+COM_CLUSTER_CUTOFF = 5.0    # nm, XY-only chain COM distance for slab detection
+
+
+# SECTION 3 — SEQUENCE INPUT
+
+ONE_TO_THREE = {
+    'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS',
+    'Q':'GLN','E':'GLU','G':'GLY','H':'HIS','I':'ILE',
+    'L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO',
+    'S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL',
+}
+FUS_LC = (
+    'MASNDYTQQATQSYGAYPTQPGQGYSQQSSQPYGQQSY'
+    'SGYSQSTDTSGYGQSSYSSYGQSQNTGYGTQSTPQGYGSTGGYGS'
+    'SQSSQSSYGQQSSYPGYGQQPAPSSTSGSYGSSSQSSSYGQPQSGSYSQQP'
+    'SYGGQQQSYGQQQSYNPPQGYGQQNQYNS'
+) #FUS-LC protein sequence
+
+def read_fasta(path):
+    seq = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('>') or line.startswith('#'):
+                continue
+            for c in line:
+                if c in ONE_TO_THREE:
+                    seq.append(ONE_TO_THREE[c])
+    return seq
+
+if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+    sequence_aa = read_fasta(sys.argv[1])
+    print(f"Sequence: {len(sequence_aa)} residues from {sys.argv[1]}")
+else:
+    sequence_aa = [ONE_TO_THREE[c] for c in FUS_LC if c in ONE_TO_THREE]
+    print(f"Sequence: FUS-LC  {len(sequence_aa)} residues")
+
+N_res_aa = len(sequence_aa)
+
+# SECTION 4  COARSE-GRAINING
+def coarse_grain(seq_aa, stride):
+    beads = []
+    for start in range(0, len(seq_aa), stride):
+        win  = seq_aa[start : start + stride]
+        m    = np.array([MASS_AA[aa]     for aa in win])
+        s    = np.array([SIGMA_AA[aa]    for aa in win])
+        lam  = np.array([LAMBDA_URRY[aa] for aa in win])
+        q    = np.array([CHARGE_AA[aa]   for aa in win])
+        beads.append({
+            'mass'  : float(m.sum()),
+            'sigma' : float((s**3).sum() ** (1/3)),   # volume-additive
+            'lam'   : float((m * lam).sum() / m.sum()),# mass-weighted avg
+            'charge': float(q.sum()),                  # algebraic sum
+        })
+    return beads
+
+cg_beads   = coarse_grain(sequence_aa, CG_STRIDE)
+N_bead     = len(cg_beads)          # beads per chain
+N_chains   = NX * NY * NZ
+N_total    = N_bead * N_chains
+
+# CG bond parameters — springs in series
+K_BOND  = K_BOND_AA  / CG_STRIDE   # kJ/mol/nm²
+R0_BOND = R0_BOND_AA * CG_STRIDE   # nm
+
+# Per-bead property arrays (single chain)
+sigma_s  = np.array([b['sigma']   for b in cg_beads])
+lambda_s = np.array([b['lam']     for b in cg_beads])
+charge_s = np.array([b['charge']  for b in cg_beads])
+mass_s   = np.array([b['mass']    for b in cg_beads])
+gamma_s  = mass_s * GAMMA_SCALE    # per-bead friction
+
+# Check mass conservation
+MW_aa = sum(MASS_AA[aa] for aa in sequence_aa)
+MW_cg = float(mass_s.sum())
+assert abs(MW_aa - MW_cg) < 1e-2, f"Mass not conserved: {MW_aa} vs {MW_cg}"
+
+MW_chain    = MW_cg
+NM3_TO_MGML = MW_chain / 602.214076*1000  # (chains/nm³) → mg/mL
+
+print(f"\nCoarse-graining: {N_res_aa} AA → {N_bead} CG beads/chain  "
+      f"(stride={CG_STRIDE}, {100*(1-N_bead/N_res_aa):.0f}% fewer)")
+print(f"Chains: {N_chains} ({NX}×{NY}×{NZ})   Total CG beads: {N_total}")
+print(f"MW/chain: {MW_chain:.1f} g/mol   Mass conserved ✓")
+print(f"CG bond:  K={K_BOND:.1f} kJ/mol/nm²   R0={R0_BOND:.3f} nm")
+print(f"σ range:  [{sigma_s.min():.3f}, {sigma_s.max():.3f}] nm")
+
+# Tile to all chains
+kT_resize = T_RESIZE * 0.008314
+kT_prod   = T_PROD   * 0.008314
+
+sigma_arr  = jnp.tile(jnp.array(sigma_s),  N_chains)
+lambda_arr = jnp.tile(jnp.array(lambda_s), N_chains)
+charge_arr = jnp.tile(jnp.array(charge_s), N_chains)
+mass_arr   = jnp.tile(jnp.array(mass_s),   N_chains)
+gamma_arr  = jnp.tile(jnp.array(gamma_s),  N_chains)
+mass_2d    = mass_arr[:, None]
+gamma_2d   = gamma_arr[:, None]
+
+# SECTION 5 — BOND & PAIR LISTS
+
+# Bonds: consecutive beads within each chain
+chain_ids  = np.repeat(np.arange(N_chains), N_bead - 1)
+res_starts = np.tile(np.arange(N_bead - 1), N_chains)
+offsets    = chain_ids * N_bead
+bond_i = jnp.array(offsets + res_starts,     dtype=jnp.int32)
+bond_j = jnp.array(offsets + res_starts + 1, dtype=jnp.int32)
+
+# Non-bonded pairs: all unique pairs excluding 1-2 bonded neighbours
+print("Building pair list…", end=" ", flush=True)
+t0 = time.time()
+ii_all, jj_all = np.triu_indices(N_total, k=1)
+ch_i = ii_all // N_bead;  ch_j = jj_all // N_bead
+ri   = ii_all %  N_bead;  rj   = jj_all %  N_bead
+bonded = (ch_i == ch_j) & (np.abs(ri.astype(int) - rj.astype(int)) < 2)
+keep   = ~bonded
+
+pair_i = jnp.array(ii_all[keep], dtype=jnp.int32)
+pair_j = jnp.array(jj_all[keep], dtype=jnp.int32)
+
+sig_np  = np.array(sigma_arr);   lam_np = np.array(lambda_arr)
+sig_ij  = jnp.array(0.5 * (sig_np[ii_all[keep]] + sig_np[jj_all[keep]]))
+lam_ij  = jnp.array(np.clip(
+    MU * 0.5 * (lam_np[ii_all[keep]] + lam_np[jj_all[keep]]) + DELTA))
+q_i     = charge_arr[pair_i]
+q_j     = charge_arr[pair_j]
+
+print(f"{len(pair_i):,} pairs  ({time.time()-t0:.1f}s)")
+print(f"λ_ij: [{float(lam_ij.min()):.3f}, {float(lam_ij.max()):.3f}]")
+
+
+# SECTION 6  ENERGY & FORCE FUNCTIONS
+
+@jit
+def pbc_diff(ri, rj, box):
+    d = ri - rj
+    return d - box * jnp.round(d / box)
+
+@jit
+def wrap(R, box):
+    return (R + box/2) % box - box/2
+
+@jit
+def bond_energy(R, box):
+    dr = vmap(pbc_diff, in_axes=(0,0,None))(R[bond_i], R[bond_j], box)
+    r  = jnp.linalg.norm(dr, axis=1)
+    return jnp.sum(0.5 * K_BOND * (r - R0_BOND)**2)
+
+@jit
+def nonbonded_energy(R, box):
+    dr  = vmap(pbc_diff, in_axes=(0,0,None))(R[pair_i], R[pair_j], box)
+    r   = jnp.linalg.norm(dr, axis=1)
+
+    # Ashbaugh-Hatch (HPS)
+    sr    = sig_ij / jnp.maximum(r, 1e-8)
+    lj    = 4.0 * LJ_EPS * (sr**12 - sr**6)
+    r_min = 2.0**(1.0/6.0) * sig_ij
+    e_in  = lj + (1.0 - lam_ij) * LJ_EPS
+    e_out = lam_ij * lj
+    e_ah  = jnp.where(r < r_min, e_in, e_out)
+    e_ah  = jnp.where(r < R_CUT_LJ, e_ah, 0.0)
+
+    # Yukawa electrostatics 
+    rs    = jnp.maximum(r, 0.2)
+    e_yuk = (q_i * q_j * YUKAWA_PRE / rs) * jnp.exp(-YUKAWA_KAPPA * rs)
+    e_yuk = jnp.where(r < R_CUT_YUK, e_yuk, 0.0)
+
+    return jnp.sum(e_ah) + jnp.sum(e_yuk)
+
+@jit
+def total_energy(R, box):
+    return bond_energy(R, box) + nonbonded_energy(R, box)
+
+forces_fn = jit(lambda R, box: -grad(total_energy)(R, box))
+
+
+# SECTION 7 — BAOAB LANGEVIN INTEGRATOR
+# Per-particle friction : γᵢ = massᵢ / 1000  
+@jit
+def baoab_step(R, V, F, key, box, kT):
+    """
+    BAOAB: B=half-kick, A=half-drift, O=thermostat, A=half-drift, B=half-kick
+    Per-particle gamma from gamma_2d 
+    """
+    c1 = jnp.exp(-gamma_2d * DT)
+    c2 = jnp.sqrt((1.0 - c1**2) * kT / mass_2d)
+
+    # B: half velocity kick
+    V = V + 0.5 * DT * F / mass_2d
+    # A: half drift
+    R = wrap(R + 0.5 * DT * V, box)
+    # O: Ornstein-Uhlenbeck thermostat
+    key, sk = random.split(key)
+    V = c1 * V + c2 * random.normal(sk, V.shape)
+    # A: half drift
+    R = wrap(R + 0.5 * DT * V, box)
+    # recompute forces
+    F = forces_fn(R, box)
+    # B: half velocity kick
+    V = V + 0.5 * DT * F / mass_2d
+    return R, V, F, key
+
+def make_scan_body(box, kT):
+    """Wrap baoab_step for jax.lax.scan — fixed box version."""
+    @jit
+    def body(carry, _):
+        R, V, F, key = carry
+        R, V, F, key = baoab_step(R, V, F, key, box, kT)
+        return (R, V, F, key), None
+    return body
+
+def init_velocities(key, kT):
+    return random.normal(key, (N_total, 3)) * jnp.sqrt(kT / mass_2d)
+    
+# SECTION 8 — STAGE 1: BUILD SINGLE rod like chain along Z, centred at origin
+def build_single_chain_stick(N_bead, R0):
+    pos = np.zeros((N_bead, 3))
+    for r in range(N_bead):
+        pos[r, 2] = (r - (N_bead - 1) / 2.0) * R0
+    return pos
+
+
+# SECTION 9 — STAGE 2: REPLICATE  
+# Tile the single chain into NX×NY×NZ grid in a box large enough that no two chains overlap at all
+
+def replicate(single_chain, NX, NY, NZ, box_L):
+"
+    N_bead = len(single_chain)
+    pos = []
+    for ix in range(NX):
+        for iy in range(NY):
+            for iz in range(NZ):
+                cx = -box_L/2 + (ix + 0.5) * (box_L / NX)
+                cy = -box_L/2 + (iy + 0.5) * (box_L / NY)
+                cz = -box_L/2 + (iz + 0.5) * (box_L / NZ)
+                for r in range(N_bead):
+                    pos.append([cx + single_chain[r, 0],
+                                 cy + single_chain[r, 1],
+                                 cz + single_chain[r, 2]])
+    return np.array(pos)
+
+single_chain = build_single_chain_stick(N_bead, R0_BOND)
+chain_extent = (N_bead - 1) * R0_BOND             
+cell_size    = chain_extent + 2.0                  # 2 nm buffer per cell
+init_box_L   = max(NX, NY, NZ) * cell_size
+
+print(f"\nChain stick length: {chain_extent:.1f} nm")
+print(f"Initial box: {init_box_L:.1f} nm  (cell={cell_size:.1f} nm, "
+      f"grid={NX}×{NY}×{NZ})")
+
+pos_init = replicate(single_chain, NX, NY, NZ, init_box_L)
+print(f"Replicated: {N_chains} chains × {N_bead} beads = {N_total} total beads")
+
+
+# SECTION 10 — STAGE 3: BOX RESIZE + NVT  #This is where box resizing runs
+#together with NVT simulation so the protein gets an equilibrated configuration while being resized 
+
+
+# Safe shrink rate: < 20 nm/ns  → Steps are calculated automatically based on the box size  according to steps > (init_box-15) nm / 20 nm/ns / dt
+
+# Auto-compute RESIZE_STEPS for safe shrink rate
+safe_rate_nm_per_ns = 15.0   # nm/ns
+min_steps = int((init_box_L - BOX_CUBE_NM) / safe_rate_nm_per_ns * 1000.0 / DT)
+RESIZE_STEPS = RESIZE_STEPS_OVERRIDE if RESIZE_STEPS_OVERRIDE else max(min_steps, 100_000)
+resize_time_ns = RESIZE_STEPS * DT / 1000.0
+actual_rate    = (init_box_L - BOX_CUBE_NM) / resize_time_ns
+
+print(f"\n{'='*60}")
+print(f"STAGE 3: Box resize + NVT")
+print(f"  {init_box_L:.1f} → {BOX_CUBE_NM:.1f} nm   over {resize_time_ns:.1f} ns")
+print(f"  {RESIZE_STEPS:,} steps   shrink rate = {actual_rate:.1f} nm/ns")
+print(f"  T = {T_RESIZE} K   dt = {DT} ps")
+
+# Jax patch
+import jax.random as _jr
+if not hasattr(_jr, 'KeyArray'):
+    try:
+        from jax._src.prng import PRNGKeyArray
+        _jr.KeyArray = PRNGKeyArray
+    except ImportError:
+        pass
+
+print(f"Device: {jax.devices()}")
+
+key   = random.PRNGKey(42)
+key, vk = random.split(key)
+box_now  = jnp.array([init_box_L, init_box_L, init_box_L])
+R = wrap(jnp.array(pos_init), box_now)
+V = init_velocities(vk, kT_resize)
+F = forces_fn(R, box_now)
+
+box_schedule = np.linspace(float(init_box_L), BOX_CUBE_NM, RESIZE_STEPS)
+log_every_resize = max(1, RESIZE_STEPS // 20)
+t0_resize = time.time()
+
+for step in range(RESIZE_STEPS):
+    L_new = float(box_schedule[step])
+    box_new = jnp.array([L_new, L_new, L_new])
+
+    # scale_particles=True: positions scale proportionally with box
+    if step > 0:
+        scale = L_new / float(box_schedule[step - 1])
+        R = R * scale
+
+    R = wrap(R, box_new)
+
+    # Safety: clip forces to prevent explosion if any early overlap
+    
+    F = jnp.clip(F, -1000.0, 1000.0)
+
+    R, V, F, key = baoab_step(R, V, F, key, box_new, kT_resize)
+
+    if step % log_every_resize == 0:
+        t_ns  = step * DT / 1000.0
+        e_val = float(total_energy(R, box_new))
+        Fmax  = float(jnp.abs(F).max())
+        # Rg of chain 0 as progress indicator
+        pos0  = np.array(R[:N_bead])
+        com0  = pos0.mean(axis=0)
+        rg0   = float(np.sqrt(np.mean(np.sum((pos0 - com0)**2, axis=1))))
+        print(f"  resize {step:8d} ({t_ns:6.2f} ns) | "
+              f"box={L_new:6.2f} nm | E={e_val:10.1f} | "
+              f"Fmax={Fmax:7.1f} | Rg(chain0)={rg0:.2f} nm")
+
+box_cube = jnp.array([BOX_CUBE_NM, BOX_CUBE_NM, BOX_CUBE_NM])
+R = wrap(R, box_cube)
+print(f"  Resize done in {(time.time()-t0_resize)/60:.1f} min")
+print(f"  Final box: {BOX_CUBE_NM:.1f}³ nm")
+
+np.save("resize_final.npy", np.array(R))
+
+# SECTION 11 — STAGE 4: EXTEND TO SLAB 
+# Result: all chains sit in a thin central slab, tall empty wings above/below
+
+print(f"\n{'='*60}")
+print(f"STAGE 4: Extend to slab  Z: {BOX_CUBE_NM:.1f} → {SLAB_Z_NM:.1f} nm  (no MD)")
+
+R_np = np.array(R)
+L    = BOX_CUBE_NM
+
+for c in range(N_chains):
+    s = c * N_bead
+    e = s + N_bead
+    mol_z = R_np[s:e, 2].copy()
+
+    # Unwrap bonds across Phase Boundary Conditions-PBC
+    for r in range(1, N_bead):
+        dist2 = (mol_z[r] - mol_z[r-1])**2
+        if dist2 > (L/2)**2:
+            mol_z[r] -= np.sign(mol_z[r] - mol_z[r-1]) * L
+
+    # Re-center COM inside old cubic box
+    com_z = float(np.mean(mol_z))
+    if com_z < -L/2: mol_z += L
+    elif com_z >  L/2: mol_z -= L
+
+    R_np[s:e, 2] = mol_z
+
+# Change box Z only — particles keep their physical coordinates
+z_lo  = R_np[:, 2].min()
+z_hi  = R_np[:, 2].max()
+z_span = z_hi - z_lo
+wing  = (SLAB_Z_NM - z_span) / 2.0
+
+box_slab = jnp.array([BOX_CUBE_NM, BOX_CUBE_NM, SLAB_Z_NM])
+R = jnp.array(R_np)
+
+np.save("slab_start.npy", R_np)
+# SECTION 12 — STAGE 5: NVT EQUILIBRATION :HERE 1 STEP CUZ THE RUN IS IN OTHER SCRIPT
+
+print(f"\n{'='*60}")
+print(f"STAGE 5: NVT equilibration  T={T_PROD} K  {EQUIL_STEPS} steps "
+      f"({EQUIL_STEPS*DT/1000:.1f} ns)")
+
+key, vk = random.split(key)
+V = init_velocities(vk, kT_prod)
+F = forces_fn(R, box_slab)
+
+equil_body = make_scan_body(box_slab, kT_prod)
+e_hist = []
+
+for step in range(0, EQUIL_STEPS, LOG_EVERY):
+    (R, V, F, key), _ = jax.lax.scan(
+        equil_body, (R, V, F, key), None, length=LOG_EVERY)
+
+    R_np_e = np.array(R)
+    e_val  = float(total_energy(R, box_slab))
+    ke     = float(0.5 * jnp.sum(mass_2d * V**2))
+    T_inst = 2.0 * ke / (3.0 * N_total * 0.008314)
+
+    # Rg: mean over all chains
+    R_ch   = R_np_e.reshape(N_chains, N_bead, 3)
+    rg_all = [np.sqrt(np.mean(np.sum((R_ch[c] - R_ch[c].mean(0))**2, 1)))
+              for c in range(N_chains)]
+    rg_mean = float(np.mean(rg_all))
+
+    e_hist.append(e_val)
+    n = len(e_hist); q = max(1, n//4)
+    drift = (abs(np.mean(e_hist[-q:]) - np.mean(e_hist[:q]))
+             / (abs(np.mean(e_hist[:q])) + 1e-10)) if n >= 4 else 1.0
+
+    print(f"  equil {step+LOG_EVERY:7d} | E={e_val:10.1f} | "
+          f"T={T_inst:.1f} K | Rg={rg_mean:.2f} nm | drift={drift:.4f}")
+
+np.save("equil_final.npy", np.array(R))
+
+
+# SECTION 13 — STAGE 6: PRODUCTION NVT 1 STEP BECAUSE THE RUN IS IN THE OTHER SCRIPT
+
+print(f"\n{'='*60}")
+print(f"STAGE 6: Production NVT  T={T_PROD} K  "
+      f"{PRODUCTION_STEPS} steps  ({PRODUCTION_STEPS*DT/1000:.1f} ns)")
+print(f"  Box: {BOX_CUBE_NM:.1f}×{BOX_CUBE_NM:.1f}×{SLAB_Z_NM:.1f} nm")
+
+prod_body = make_scan_body(box_slab, kT_prod)
+box_np    = np.array(box_slab)
+
+# Storage
+traj = dict(step=[], E=[], T=[], Rg=[],
+            rho_d=[], rho_dl=[], c_d=[], c_dl=[], n_slab=[])
+density_frames = []
+z_axis = None
+us_profiles = {}   
+
+
+
+def chain_coms(R_np):
+    """Mass-weighted COM of each chain, unwrapped along all dims."""
+    Lx, Ly, Lz = box_np
+    R_ch = R_np.reshape(N_chains, N_bead, 3)
+    coms = np.empty((N_chains, 3))
+    for c in range(N_chains):
+        pos = R_ch[c].copy()
+        # unwrap all dims
+        for dim, L in enumerate([Lx, Ly, Lz]):
+            for r in range(1, N_bead):
+                d = pos[r, dim] - pos[r-1, dim]
+                pos[r, dim] -= L * np.round(d / L)
+        com = (mass_s[:, None] * pos).sum(0) / mass_s.sum()
+        # wrap COM back into box
+        for dim, L in enumerate([Lx, Ly, Lz]):
+            com[dim] = (com[dim] + L/2) % L - L/2
+        coms[c] = com
+    return coms
+
+def detect_slab(coms):
+
+    Lx, Ly, Lz = box_np
+    dxy = coms[:, None, :2] - coms[None, :, :2]
+    dxy[:,:,0] -= Lx * np.round(dxy[:,:,0] / Lx)
+    dxy[:,:,1] -= Ly * np.round(dxy[:,:,1] / Ly)
+    dist = np.sqrt((dxy**2).sum(-1))
+
+    adj = (dist < COM_CLUSTER_CUTOFF).astype(np.float32)
+    np.fill_diagonal(adj, 0)
+    _, labels = connected_components(csr_matrix(adj), directed=False,
+                                     return_labels=True)
+    sizes  = np.bincount(labels)
+    best   = int(np.argmax(sizes))
+
+    if sizes[best] <= 1:   # fall back to 3D
+        d3 = coms[:, None, :] - coms[None, :, :]
+        d3 -= np.array([Lx,Ly,Lz])[None,None,:] * np.round(
+              d3 / np.array([Lx,Ly,Lz])[None,None,:])
+        dist3 = np.sqrt((d3**2).sum(-1))
+        adj3  = (dist3 < COM_CLUSTER_CUTOFF).astype(np.float32)
+        np.fill_diagonal(adj3, 0)
+        _, labels = connected_components(csr_matrix(adj3), directed=False,
+                                         return_labels=True)
+        sizes = np.bincount(labels)
+        best  = int(np.argmax(sizes))
+
+    return labels == best, int(sizes[best])
+
+def density_profile(R_np):
+
+    Lx, Ly, Lz = box_np
+    coms = chain_coms(R_np)
+    mask, n_slab = detect_slab(coms)
+
+    # Re-centre: shift everything so slab COM sits at z=0
+    if n_slab > 0:
+        slab_z = coms[mask, 2]
+        slab_z = slab_z - Lz * np.round(slab_z / Lz)
+        shift  = float(slab_z.mean())
+    else:
+        shift = 0.0
+
+    z = (R_np[:, 2] - shift + Lz/2) % Lz - Lz/2
+    edges = np.linspace(-Lz/2, Lz/2, PROFILE_BINS + 1)
+    cnt, _ = np.histogram(z, bins=edges)
+    vol    = Lx * Ly * (Lz / PROFILE_BINS)
+    return 0.5*(edges[:-1]+edges[1:]), cnt/vol, n_slab
+
+def coexistence(zc, dens):
+
+    half   = float(zc[-1])
+    z_d    = half * 0.15
+    z_dl   = half * 0.75
+    dm     = np.abs(zc) < z_d
+    dil    = np.abs(zc) > z_dl
+    rho_d  = float(dens[dm].mean())  if dm.any()  else float('nan')
+    rho_dl = float(dens[dil].mean()) if dil.any() else float('nan')
+    # beads/nm³ → chains/nm³ → mg/mL
+    c_d    = (rho_d  / N_bead) * MW_chain / 602.214076*1000
+    c_dl   = (rho_dl / N_bead) * MW_chain / 602.214076*1000
+    return rho_d, rho_dl, c_d, c_dl
+
+
+hdr = (f"{'step':>9} {'E':>11} {'T':>6} {'Rg':>6} "
+       f"{'slab':>5} {'ρ_d':>8} {'ρ_dl':>9} "
+       f"{'c_d mg/mL':>10} {'c_dl':>8} "
+       f"{'z_p10':>7} {'z_p50':>7} {'z_p90':>7}")
+print(f"\n{hdr}\n{'-'*len(hdr)}")
+
+t_start = time.time()
+
+for step in range(0, PRODUCTION_STEPS, LOG_EVERY):
+    (R, V, F, key), _ = jax.lax.scan(
+        prod_body, (R, V, F, key), None, length=LOG_EVERY)
+
+    R_np  = np.array(R)
+    e_val = float(total_energy(R, box_slab))
+    ke    = float(0.5 * jnp.sum(mass_2d * V**2))
+    T_now = 2.0 * ke / (3.0 * N_total * 0.008314)
+
+    R_ch  = R_np.reshape(N_chains, N_bead, 3)
+    rg_mean = float(np.mean([
+        np.sqrt(np.mean(np.sum((R_ch[c]-R_ch[c].mean(0))**2, 1)))
+        for c in range(N_chains)]))
+
+    zc, dens, n_slab = density_profile(R_np)
+    rho_d, rho_dl, c_d, c_dl = coexistence(zc, dens)
+    z_axis = zc
+    density_frames.append(dens)
+
+    coms_z = np.sort(chain_coms(R_np)[:, 2])
+    p10, p50, p90 = np.percentile(coms_z, [10, 50, 90])
+
+    # Store
+    traj['step'].append(step + LOG_EVERY)
+    traj['E'].append(e_val); traj['T'].append(T_now); traj['Rg'].append(rg_mean)
+    traj['rho_d'].append(rho_d); traj['rho_dl'].append(rho_dl)
+    traj['c_d'].append(c_d); traj['c_dl'].append(c_dl)
+    traj['n_slab'].append(n_slab)
+
+    # Per-µs density accumulation
+    us_idx = int((step + LOG_EVERY) * DT / 1e6)
+    us_profiles.setdefault(us_idx, []).append(dens)
+
+    print(f"{step+LOG_EVERY:>9d} {e_val:>11.1f} {T_now:>6.1f} {rg_mean:>6.3f} "
+          f"{n_slab:>5d} {rho_d:>8.4f} {rho_dl:>9.5f} "
+          f"{c_d:>10.3f} {c_dl:>8.4f} "
+          f"{p10:>+7.1f} {p50:>+7.1f} {p90:>+7.1f}")
+
+    if len(traj['step']) % 5 == 0:
+        np.save("prod_ckpt.npy", R_np)
+
+t_prod = time.time() - t_start
+print(f"\nProduction done in {t_prod/3600:.2f} h")
+np.save("prod_final.npy", np.array(R))
+
+# SECTION 14 — ANALYSIS & FIGURES
+
+print("\nGenerating figures…")
+
+if z_axis is not None and density_frames:
+    half   = max(1, len(density_frames) // 2)
+    avg_d  = np.mean(density_frames[half:], axis=0)
+    rho_d_f, rho_dl_f, cd_f, cdl_f = coexistence(z_axis, avg_d)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4),
+                              facecolor='white', constrained_layout=True)
+
+    # --- Plot 1: density profile per µs window ---
+    ax = axes[0]
+    cmap = plt.get_cmap("viridis")
+    us_keys = sorted(us_profiles.keys())
+    for k, us in enumerate(us_keys):
+        avg = np.mean(us_profiles[us], axis=0)
+        d_mgml = (avg / N_bead) * MW_chain / 602.214076*1000
+        ax.plot(z_axis, d_mgml, lw=1.5,
+                color=cmap(k / max(len(us_keys)-1, 1)),
+                label=f"{us}µs")
+    ax.set_xlabel("z (nm)"); ax.set_ylabel("Density (mg/mL)")
+    ax.set_title(f"Slab density profile  T={T_PROD} K")
+    ax.legend(title="Time", fontsize=7, ncol=2)
+    ax.set_xlim(-SLAB_Z_NM/2, SLAB_Z_NM/2)
+    ax.axvline(-SLAB_Z_NM/2*0.75, color='gray', ls='--', lw=0.8, alpha=0.5)
+    ax.axvline( SLAB_Z_NM/2*0.75, color='gray', ls='--', lw=0.8, alpha=0.5)
+    ax.text(0, ax.get_ylim()[1]*0.9, 'dense', ha='center', fontsize=8, color='navy')
+    ax.text(SLAB_Z_NM/2*0.88, ax.get_ylim()[1]*0.5,
+            'dilute', ha='center', fontsize=8, color='coral', rotation=90)
+
+    # --- Plot 2: coexistence concentrations over time ---
+    ax2 = axes[1]
+    t_ns = np.array(traj['step']) * DT / 1000
+    ax2.plot(t_ns, traj['c_d'],  lw=1.5, color='navy',  label="Dense phase")
+    ax2.plot(t_ns, traj['c_dl'], lw=1.5, color='coral', label="Dilute phase")
+    ax2.set_xlabel("Time (ns)"); ax2.set_ylabel("Concentration (mg/mL)")
+    ax2.set_title("Coexistence concentrations")
+    ax2.legend()
+    ax2.axhline(cd_f,  color='navy',  ls='--', lw=0.8)
+    ax2.axhline(cdl_f, color='coral', ls='--', lw=0.8)
+
+    # --- Plot 3: slab size + Rg over time ---
+    ax3 = axes[2]
+    ax3.plot(t_ns, traj['n_slab'], lw=1.5, color='green', label="Chains in slab")
+    ax3b = ax3.twinx()
+    ax3b.plot(t_ns, traj['Rg'], lw=1.5, color='orange', ls='--', label="Rg (nm)")
+    ax3.set_xlabel("Time (ns)"); ax3.set_ylabel("N chains in condensate")
+    ax3b.set_ylabel("Rg (nm)")
+    ax3.set_title("Condensate size & chain dimensions")
+    lines1, lbl1 = ax3.get_legend_handles_labels()
+    lines2, lbl2 = ax3b.get_legend_handles_labels()
+    ax3.legend(lines1+lines2, lbl1+lbl2, fontsize=8)
+
+    plt.savefig("llps_results.png", dpi=150, bbox_inches='tight')
+
+
+    # --- Diagnostics figure ---
+    fig2, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    axs[0,0].plot(t_ns, traj['E']);  axs[0,0].set(title="Energy", xlabel="Time (ns)")
+    axs[0,1].plot(t_ns, traj['T']);  axs[0,1].set(title="Temperature (K)", xlabel="Time (ns)")
+    axs[0,1].axhline(T_PROD, color='r', ls='--', lw=0.8)
+    axs[1,0].plot(t_ns, traj['Rg']); axs[1,0].set(title="Rg (nm)", xlabel="Time (ns)")
+    axs[1,1].plot(t_ns, traj['c_d'],  label="Dense")
+    axs[1,1].plot(t_ns, traj['c_dl'], label="Dilute")
+    axs[1,1].legend(); axs[1,1].set(title="Concentration (mg/mL)", xlabel="Time (ns)")
+    plt.savefig("llps_diagnostics.png", dpi=150, bbox_inches='tight')
+
+# SECTION 15 — SAVE RESULTS
+
+half = max(1, len(density_frames)//2)
+avg_d = np.mean(density_frames[half:], axis=0) if density_frames else np.zeros(PROFILE_BINS)
+rho_d_f, rho_dl_f, cd_f, cdl_f = coexistence(
+    z_axis if z_axis is not None else np.zeros(PROFILE_BINS), avg_d)
+
+np.savez("llps_results.npz",
+         z=z_axis, density_avg=avg_d,
+         **{k: np.array(v) for k, v in traj.items()},
+         c_dense_mgml=cd_f, c_dilute_mgml=cdl_f,
+         cg_stride=CG_STRIDE,
+         cg_mass=mass_s, cg_sigma=sigma_s,
+         cg_lambda=lambda_s, cg_charge=charge_s)
+
+print(f"\n{'='*60}")
+print("FINAL SUMMARY")
+print(f"  Protein:         FUS-LC  {N_res_aa} AA → {N_bead} CG beads/chain")
+print(f"  CG stride:       {CG_STRIDE} residues/bead")
+print(f"  Chains:          {N_chains}  ({NX}×{NY}×{NZ})")
+print(f"  Total beads:     {N_total}  (was {N_res_aa*N_chains} AA)")
+print(f"  Pair reduction:  ~{(N_res_aa/N_bead)**2:.0f}×")
+print(f"  T production:    {T_PROD} K")
+print(f"  Box (slab):      {BOX_CUBE_NM:.1f}×{BOX_CUBE_NM:.1f}×{SLAB_Z_NM:.0f} nm")
+print(f"  Dense phase:     {cd_f:.2f} mg/mL")
+print(f"  Dilute phase:    {cdl_f:.4f} mg/mL")
+print(f"  Wall time:       {t_prod/3600:.2f} h")
+print(f"{'='*60}")
+  
+###############################################################################################################################################################################
+#You run this to save the file created after the box is resized TO C=create the file for the next script.
+np.savez("BOXcheckpoint_manual.npz",
+         R        = np.array(R),
+         V        = np.array(V),
+         F        = np.array(F),
+         key      = np.array(key),
+         box_xy   = np.array(BOX_CUBE_NM),
+         box_z    = np.array(SLAB_Z_NM),
+         N_chains = np.array(N_chains),
+         N_bead   = np.array(N_bead),
+         MW_chain = np.array(MW_chain),
+         sigma_s  = sigma_s,
+         lambda_s = lambda_s,
+         charge_s = charge_s,
+         mass_s   = mass_s,
+         e_hist   = np.array(e_hist) if 'e_hist' in dir() else np.array([]),
+)
+
+print(f"R shape: {np.array(R).shape}")
+print(f"box: {BOX_CUBE_NM} x {BOX_CUBE_NM} x {SLAB_Z_NM} nm")
