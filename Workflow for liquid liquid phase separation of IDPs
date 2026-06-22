@@ -121,7 +121,7 @@ R_CUT_LJ     = 2.0
 R_CUT_YUK    = 3.5
 K_BOND_AA    = 4000.0 # kJmol-1 #the stifness is k_b=2*K_BOND_AA computed in JAX-MD  energy.simple_spring_bond
 R0_BOND_AA   = 0.38 #nm for rearranged resolution will be 3.8nm
-YUKAWA_PRE   = 1.73136 #Equation form 1/(4πD) 
+YUKAWA_PRE   = 1.73136 kJ·nm·mol⁻¹·e⁻² 
 YUKAWA_KAPPA = 1.0 # Kappa = 1.0 nm-1 (≈100 mM salt)
 DT           = 0.01 #ps
 T_PROD       = 300.0#K
