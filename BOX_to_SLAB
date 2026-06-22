@@ -113,7 +113,7 @@ D             = 80           #Dielectric constant
 LJ_EPS        = 0.8368       # kJ/mol
 R_CUT_LJ      = 2.0          # nm
 R_CUT_YUK     = 3.5          # nm
-K_BOND_AA     = 8368.0       # kJ/mol/nm² 
+K_BOND_AA    = 4000.0 # kJmol-1 #the stifness is k_b=2*K_BOND_AA computed in JAX-MD  energy.simple_spring_bond
 R0_BOND_AA    = 0.38         # nm   when arranged to 10 amino acids to 1 bead it will be 3.8nm       
 YUKAWA_PRE    = 1.73136      # kJ·nm/mol/e² 
 YUKAWA_KAPPA  = 1.0          # nm⁻¹
@@ -224,7 +224,7 @@ gamma_arr  = jnp.tile(jnp.array(gamma_s),  N_chains)
 mass_2d    = mass_arr[:, None]
 gamma_2d   = gamma_arr[:, None]
 
-# SECTION 5 — BOND & PAIR LISTS
+# SECTION 5  BOND & PAIR LISTS
 
 # Bonds: consecutive beads within each chain
 chain_ids  = np.repeat(np.arange(N_chains), N_bead - 1)
